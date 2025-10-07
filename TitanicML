@@ -1,0 +1,189 @@
+# ============================================================
+#  TITANIC SURVIVAL — Optimized Threshold & Light Meta-Ensemble
+#  Author: Rob Moore
+#  Description:
+#      Machine learning workflow for the classic Kaggle Titanic
+#      competition. Uses engineered features and an optimized
+#      weighted ensemble of Gradient Boosting and Logistic Regression.
+# ============================================================
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# ------------------------------------------------------------
+# 1. Load and prepare data
+# ------------------------------------------------------------
+# Replace with your dataset path
+train = pd.read_csv("path_to_data/train.csv")
+df = train.copy()
+
+# Fill missing ages by group medians within (Sex, Pclass)
+df["IsAgeMissing"] = df["Age"].isna().astype(int)
+df["Age"] = df.groupby(["Sex", "Pclass"])["Age"].transform(lambda x: x.fillna(x.median()))
+df["Fare"] = df["Fare"].fillna(df["Fare"].median())
+
+# ------------------------------------------------------------
+# 2. Feature Engineering
+# ------------------------------------------------------------
+
+# Extract social title from name (Mr, Miss, Mrs, etc.)
+df["Title"] = df["Name"].str.extract(" ([A-Za-z]+)\.")
+df["Title"] = df["Title"].map({"Mr": 0, "Miss": 1, "Mrs": 2, "Master": 3}).fillna(4)
+
+# Cabin and deck info
+df["Deck"] = df["Cabin"].astype(str).str[0]
+deck_map = {"A": 1, "B": 2, "C": 3, "D": 4, "E": 5, "F": 6, "G": 7, "T": 8}
+df["DeckCode"] = df["Deck"].map(deck_map).fillna(9)
+
+# Structural safety proxies
+df["FloodRisk"] = df["Deck"].isin(["F", "G"]).astype(int)
+deck_height = {"A": 1, "B": 2, "C": 3, "D": 4, "E": 5, "F": 6, "G": 7, "T": 8}
+df["DeckHeight"] = df["Cabin"].astype(str).str[0].map(deck_height).fillna(8)
+df["VerticalDistance"] = df["DeckHeight"] / df["DeckHeight"].max()
+df["SectionDistance"] = df["Pclass"].map({1: 0.2, 2: 0.6, 3: 1.0})
+df["DistanceToLifeboat"] = 0.7 * df["VerticalDistance"] + 0.3 * df["SectionDistance"]
+
+# Simulated flood timing for context (conceptual proxy)
+flood_time = {"A": 130, "B": 120, "C": 100, "D": 60, "E": 30, "F": 5, "G": 0, "T": 0}
+df["FloodingDelayMin"] = df["Deck"].map(flood_time).fillna(80)
+df["FloodingDelayNorm"] = df["FloodingDelayMin"] / df["FloodingDelayMin"].max()
+df["EvacuationOpportunity"] = 0.6 * df["FloodingDelayNorm"] + 0.4 * (1 - df["DistanceToLifeboat"])
+
+# Family and social structure
+df["FamilySize"] = df["SibSp"] + df["Parch"] + 1
+df["IsAlone"] = (df["FamilySize"] == 1).astype(int)
+df["TicketGroupSize"] = df.groupby("Ticket")["PassengerId"].transform("count")
+df["FarePerPerson"] = df["Fare"] / df["TicketGroupSize"]
+df["GroupType"] = np.where(
+    (df["SibSp"] + df["Parch"]) > 0,
+    "Family",
+    np.where(df["TicketGroupSize"] > 1, "Social", "Solo"),
+)
+df["GroupTypeCode"] = df["GroupType"].map({"Solo": 0, "Social": 1, "Family": 2})
+
+# Encode gender
+df["Sex"] = df["Sex"].map({"male": 0, "female": 1})
+
+# Feature interactions
+df["Sex_Title"] = df["Sex"] * df["Title"]
+df["FareDeckInteraction"] = df["FarePerPerson"] * df["DeckCode"]
+df["FamilyFare"] = df["FamilySize"] * df["FarePerPerson"]
+
+# Selected features
+features = [
+    "Pclass", "Sex", "Age", "FarePerPerson", "FamilySize", "IsAlone",
+    "TicketGroupSize", "GroupTypeCode", "Title", "DeckCode", "FloodRisk",
+    "DistanceToLifeboat", "FloodingDelayNorm", "EvacuationOpportunity",
+    "Sex_Title", "FareDeckInteraction", "FamilyFare"
+]
+
+X = df[features]
+y = df["Survived"]
+
+# Split data for validation
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+# ------------------------------------------------------------
+# 3. Model Training
+# ------------------------------------------------------------
+# Gradient Boosting for nonlinear patterns
+gb = GradientBoostingClassifier(
+    n_estimators=500,
+    learning_rate=0.04,
+    max_depth=3,
+    subsample=0.8,
+    random_state=42,
+)
+gb.fit(X_train, y_train)
+
+# Probability calibration improves reliability
+calibrated_gb = CalibratedClassifierCV(gb, method="isotonic", cv=5)
+calibrated_gb.fit(X_train, y_train)
+
+# Logistic Regression for linear contrast
+logit = LogisticRegression(max_iter=1000)
+logit.fit(X_train, y_train)
+
+# ------------------------------------------------------------
+# 4. Ensemble and Threshold Optimization
+# ------------------------------------------------------------
+probs_gb = calibrated_gb.predict_proba(X_test)[:, 1]
+probs_lr = logit.predict_proba(X_test)[:, 1]
+
+# Blend the two probability sets
+probs = (0.7 * probs_gb) + (0.3 * probs_lr)
+
+# ROC-based optimal threshold search
+fpr, tpr, thresholds = roc_curve(y_test, probs)
+best_thresh = thresholds[np.argmax(tpr - fpr)]
+print("Optimal Threshold:", round(best_thresh, 3))
+
+# Evaluate ensemble performance
+y_pred = (probs >= best_thresh).astype(int)
+print("Accuracy:", round(accuracy_score(y_test, y_pred), 4))
+print("ROC-AUC:", round(roc_auc_score(y_test, probs), 4))
+
+# ------------------------------------------------------------
+# 5. Generate Kaggle Submission
+# ------------------------------------------------------------
+test = pd.read_csv("path_to_data/test.csv")
+test_df = test.copy()
+
+# Repeat feature engineering on test data
+test_df["Title"] = test_df["Name"].str.extract(" ([A-Za-z]+)\.")
+test_df["Title"] = test_df["Title"].map({"Mr": 0, "Miss": 1, "Mrs": 2, "Master": 3}).fillna(4)
+test_df["Deck"] = test_df["Cabin"].astype(str).str[0]
+test_df["DeckCode"] = test_df["Deck"].map(deck_map).fillna(9)
+test_df["FloodRisk"] = test_df["Deck"].isin(["F", "G"]).astype(int)
+test_df["DeckHeight"] = test_df["Cabin"].astype(str).str[0].map(deck_height).fillna(8)
+test_df["VerticalDistance"] = test_df["DeckHeight"] / test_df["DeckHeight"].max()
+test_df["SectionDistance"] = test_df["Pclass"].map({1: 0.2, 2: 0.6, 3: 1.0})
+test_df["DistanceToLifeboat"] = 0.7 * test_df["VerticalDistance"] + 0.3 * test_df["SectionDistance"]
+test_df["FloodingDelayMin"] = test_df["Deck"].map(flood_time).fillna(80)
+test_df["FloodingDelayNorm"] = test_df["FloodingDelayMin"] / test_df["FloodingDelayMin"].max()
+test_df["EvacuationOpportunity"] = 0.6 * test_df["FloodingDelayNorm"] + 0.4 * (1 - test_df["DistanceToLifeboat"])
+test_df["Age"] = test_df.groupby(["Sex", "Pclass"])["Age"].transform(lambda x: x.fillna(x.median()))
+test_df["Age"] = test_df["Age"].fillna(test_df["Age"].median())
+test_df["Fare"] = test_df["Fare"].fillna(test_df["Fare"].median())
+test_df["FamilySize"] = test_df["SibSp"] + test_df["Parch"] + 1
+test_df["IsAlone"] = (test_df["FamilySize"] == 1).astype(int)
+test_df["TicketGroupSize"] = test_df.groupby("Ticket")["PassengerId"].transform("count")
+test_df["FarePerPerson"] = test_df["Fare"] / test_df["TicketGroupSize"]
+test_df["GroupType"] = np.where(
+    (test_df["SibSp"] + test_df["Parch"]) > 0,
+    "Family",
+    np.where(test_df["TicketGroupSize"] > 1, "Social", "Solo"),
+)
+test_df["GroupTypeCode"] = test_df["GroupType"].map({"Solo": 0, "Social": 1, "Family": 2})
+test_df["Sex"] = test_df["Sex"].map({"male": 0, "female": 1})
+test_df["Sex_Title"] = test_df["Sex"] * test_df["Title"]
+test_df["FareDeckInteraction"] = test_df["FarePerPerson"] * test_df["DeckCode"]
+test_df["FamilyFare"] = test_df["FamilySize"] * test_df["FarePerPerson"]
+
+X_kaggle = test_df[features]
+
+# Predict on test set
+probs_gb_test = calibrated_gb.predict_proba(X_kaggle)[:, 1]
+probs_lr_test = logit.predict_proba(X_kaggle)[:, 1]
+test_probs = (0.7 * probs_gb_test) + (0.3 * probs_lr_test)
+test_pred = (test_probs >= best_thresh).astype(int)
+
+# Build submission file
+submission = pd.DataFrame({
+    "PassengerId": test_df["PassengerId"],
+    "Survived": test_pred
+})
+
+submission.to_csv("titanic_submission.csv", index=False)
+print("\n✅ Submission file created: titanic_submission.csv")
+print(submission.head())
